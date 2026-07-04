@@ -1,0 +1,13 @@
+{
+  "name": "ai-context-bridge",
+  "version": "4.1.0",
+  "description": "MCP server for cross-project context, memory, builds, and Obsidian vault access",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}
