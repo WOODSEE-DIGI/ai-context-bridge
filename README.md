@@ -13,6 +13,18 @@ It is **not** my actual memory contents — those stay in `~/.ai-context/memory/
 - **WhisperKit control** — start/stop transcription streams
 - **PAL memory helpers** — ingest and query compiled knowledge
 
+## Mandatory context saving
+
+**This is critical:** ai-context-bridge only works if your agents actually save their work. Without explicit rules, agents will do work but forget to save decisions, errors, and session state — causing knowledge loss between sessions.
+
+See [CONTEXT-SAVING-RULES.md](CONTEXT-SAVING-RULES.md) for the mandatory behavior rules you must add to your agent configuration. These rules enforce that agents:
+
+1. Read context at session start
+2. Save decisions, todos, errors, and session updates as they work
+3. Save a final session summary at session end
+
+Without these rules, your agents will treat context saving as optional and your knowledge base will be incomplete.
+
 ## Background
 
 This grew out of ideas from OpenViking, PAL, and a few other context-memory projects, but it is its own thing: a lightweight, file-first MCP server tailored to my workflow. It does not require a vector database or cloud service.
