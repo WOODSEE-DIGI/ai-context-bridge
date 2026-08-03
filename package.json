@@ -4,6 +4,7 @@
   "description": "MCP server for cross-project context, memory, builds, and Obsidian vault access",
   "type": "module",
   "main": "server.js",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "scripts": {
     "start": "node server.js"
   },

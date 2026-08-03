@@ -69,4 +69,6 @@ This is intentionally a framework, not a product. Fork it, rip out the tools you
 
 ## License
 
-MIT
+[PolyForm Noncommercial License 1.0.0](LICENSE)
+
+This software is free for noncommercial use, including personal projects, hobby use, research, and education. Commercial use requires a separate license. See the full [LICENSE](LICENSE) file for details.
