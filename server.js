@@ -16,14 +16,14 @@ import path from "path";
 import os from "os";
 import http from "http";
 import https from "https";
+import { createMemoryIndex } from "./memory-index.js";
 
 const HOME        = os.homedir();
-// Repos live on the external volume (see user setup), with projects nested in
-// category folders (e.g. AI-ML-Agents/SwiftMaestro). Override via AI_GITHUB_ROOT.
+// Repos live on an external volume by default (see user setup), with projects
+// nested in category folders (e.g. AI-ML-Agents/SwiftMaestro). Override the
+// root via AI_GITHUB_ROOT; fall back to a neutral Documents/GitHub path.
 const GITHUB_ROOT = process.env.AI_GITHUB_ROOT
-  || (fs.existsSync("/Volumes/SR2_2TB/OSINT Tools/GitHub")
-      ? "/Volumes/SR2_2TB/OSINT Tools/GitHub"
-      : path.join(HOME, "Documents", "GitHub"));
+  || path.join(HOME, "Documents", "GitHub");
 const DATA_ROOT   = path.join(HOME, ".ai-context", "data");
 const MEMORY_ROOT = path.join(HOME, ".ai-context", "memory");
 const VAULT       = path.join(HOME, "Obsidian");
@@ -169,7 +169,7 @@ function readSwiftMaestroAPIKey() {
   }
   return "";
 }
-const PAL_BASE_URL = "http://192.168.10.207:1235";
+const PAL_BASE_URL = (process.env.PAL_BASE_URL || "http://127.0.0.1:1235").replace(/\/+$/, "");
 const PAL_BEARER_TOKEN =
   process.env.PAL_BEARER_TOKEN ||
   readKeychainSecret("PAL_BEARER_TOKEN", "pal-mcp") ||
@@ -528,6 +528,40 @@ function listMemoryEntries(kind, project) {
 
 import crypto from "crypto";
 
+// --- SQLite FTS5 memory index (adopted from SwiftMaestro MemorySearchEngine) ---
+//
+// A derived SQLite FTS5 search index over the shared ~/.ai-context/memory store.
+// It turns the file-walking `searchMemoryFiles` scan into a sub-millisecond FTS
+// query. `memory_index` is null when better-sqlite3 isn't installed or the index
+// can't be built — `memory_search` then transparently falls back to the file-walk.
+let memoryIndex = null;
+let memoryIndexStarted = false;
+
+async function startMemoryIndex() {
+  if (memoryIndexStarted) return;
+  memoryIndexStarted = true;
+  try {
+    memoryIndex = await createMemoryIndex();
+    if (memoryIndex) {
+      // Warm the index in the background (first build is the only slow one).
+      memoryIndex.ensureWarm();
+    }
+  } catch {
+    memoryIndex = null;
+  }
+}
+
+/** Best-effort: keep the index fresh within its cooldown (mirrors SwiftMaestro). */
+function refreshMemoryIndex() {
+  if (!memoryIndex) return;
+  try { memoryIndex.refreshIfStale(); } catch {}
+}
+
+/** True once the index has rows; before that, memory_search falls back to file-walk. */
+function isMemoryIndexReady() {
+  return !!memoryIndex && memoryIndex.indexedCount() > 0;
+}
+
 const server = new Server({ name: "ai-context-bridge", version: "4.0.0" }, { capabilities: { tools: {} } });
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
@@ -564,7 +598,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
   { name: "memory_write", description: "Write a memory entry to the unified shared memory store. All tools (Warp, Qwen Code, QwenAgent, LM Studio) share this store.", inputSchema: { type: "object", required: ["content"], properties: { uri: { type: "string", description: "QwenURI e.g. qwen://knowledge/projects/myapp/architecture" }, kind: { type: "string", enum: ["memory","knowledge","context","skill"], description: "Memory kind (if no URI provided)" }, path: { type: "string", description: "Sub-path within kind (if no URI provided)" }, content: { type: "string" }, source: { type: "string", description: "Who is writing (e.g. warp-oz, qwen-code, user)" }, type: { type: "string", description: "Entry type: decision, note, session-update, fact, preference" }, project: { type: "string" }, tags: { type: "array", items: { type: "string" } } } } },
   { name: "memory_read", description: "Read a memory entry by QwenURI or kind+path from the unified shared memory store.", inputSchema: { type: "object", properties: { uri: { type: "string", description: "QwenURI e.g. qwen://knowledge/decisions" }, kind: { type: "string", enum: ["memory","knowledge","context","skill"] }, path: { type: "string" } } } },
   { name: "memory_search", description: "Full-text search across the entire unified shared memory store.", inputSchema: { type: "object", required: ["query"], properties: { query: { type: "string" }, max_results: { type: "number" } } } },
-  { name: "memory_list", description: "List memory entries by kind, optionally filtered by project.", inputSchema: { type: "object", properties: { kind: { type: "string", enum: ["memory","knowledge","context","skill"] }, project: { type: "string" } } } }
+  { name: "memory_list", description: "List memory entries by kind, optionally filtered by project.", inputSchema: { type: "object", properties: { kind: { type: "string", enum: ["memory","knowledge","context","skill"] }, project: { type: "string" } } } },
+  { name: "memory_index", description: "Inspect or rebuild the SQLite FTS5 memory search index. Returns the index path, memory root, indexed file count, and whether it is ready. Pass rebuild:true to force a full reindex (runs in the background for large stores).", inputSchema: { type: "object", properties: { rebuild: { type: "boolean", description: "Force a full reindex (default false)." } } } }
 ]}));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -834,6 +869,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           type: args?.type || "note", project: args?.project || "global",
           tags: args?.tags || [],
         });
+        // Refresh the FTS index within its cooldown so the new entry is
+        // searchable promptly (bounded cost; no per-write full scan).
+        refreshMemoryIndex();
         return { content: [{ type: "text", text: `✓ Memory written: ${result.uri}\n  JSON: ${result.jsonFile}\n  MD: ${result.mdFile}` }] };
       }
       case "memory_read": {
@@ -850,8 +888,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: formatText(data) }] };
       }
       case "memory_search": {
-        const results = searchMemoryFiles(args.query, args?.max_results || 20);
-        if (!results.length) return { content: [{ type: "text", text: `No results for "${args.query}" in memory.` }] };
+        const limit = Math.max(1, Math.min(Number(args?.max_results) || 20, 100));
+        const query = String(args?.query ?? "");
+        if (!query) return { content: [{ type: "text", text: "Error: query is required" }], isError: true };
+
+        // Fast path: SQLite FTS5 index (sub-millisecond, ranked). `search`
+        // returns null only while the index is still cold, in which case we
+        // fall through to the file-walking scan for an immediate (correct)
+        // answer until the background build finishes.
+        if (memoryIndex) {
+          refreshMemoryIndex();
+          const hits = memoryIndex.search(query, limit);
+          if (hits !== null) {
+            if (!hits.length) return { content: [{ type: "text", text: `No results for "${query}" in memory.` }] };
+            const formatted = hits.map(r => `--- ${r.path} ---\n${r.snippet}`).join("\n\n");
+            const note = isMemoryIndexReady() ? "" : "\n\n(index still warming — results from current index)";
+            return { content: [{ type: "text", text: `${hits.length} result(s):\n\n${formatted}${note}` }] };
+          }
+        }
+
+        const results = searchMemoryFiles(query, limit);
+        if (!results.length) return { content: [{ type: "text", text: `No results for "${query}" in memory.` }] };
         const formatted = results.map(r => `--- ${r.file} (line ${r.line}) ---\n${r.snippet}`).join("\n\n");
         return { content: [{ type: "text", text: `${results.length} result(s):\n\n${formatted}` }] };
       }
@@ -861,6 +918,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!entries.length) return { content: [{ type: "text", text: `No entries in ${kind}${args?.project ? ` for project ${args.project}` : ""}.` }] };
         const formatted = entries.map(e => `  ${e.uri}  [${e.type}] ${e.project} ${e.timestamp || ""} ${(e.tags||[]).map(t=>`#${t}`).join(" ")}`).join("\n");
         return { content: [{ type: "text", text: `${entries.length} entries in ${kind}:\n${formatted}` }] };
+      }
+      case "memory_index": {
+        if (args?.rebuild) {
+          if (memoryIndex) memoryIndex.reindexSync();
+          else return { content: [{ type: "text", text: "Memory index not available (better-sqlite3 not installed). Falling back to file-walking search." }] };
+        }
+        if (!memoryIndex) {
+          return { content: [{ type: "text", text: "Memory index: UNAVAILABLE (better-sqlite3 not installed). memory_search will use the slower file-walking scan." }] };
+        }
+        const ready = isMemoryIndexReady();
+        return { content: [{ type: "text", text: formatText({
+          available: true,
+          ready,
+          note: ready ? "" : "still warming — first build runs in the background",
+          index_path: memoryIndex.indexPath,
+          memory_root: memoryIndex.memoryRoot,
+          indexed_files: memoryIndex.indexedCount(),
+        }) }] };
       }
       case "execute_command": {
         const cwd = args?.cwd || GITHUB_ROOT;
@@ -1054,4 +1129,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 const transport = new StdioServerTransport();
+
+// Warm the SQLite FTS5 memory index in the background; this returns immediately
+// and never blocks server startup. Until it finishes, memory_search falls back
+// to the (correct but slower) file-walking scan.
+startMemoryIndex();
+
 await server.connect(transport);
