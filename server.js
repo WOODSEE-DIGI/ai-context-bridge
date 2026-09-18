@@ -56,14 +56,16 @@ function globToRegex(glob) {
   }
   return new RegExp("^" + re + "$");
 }
+let contextIndexChild = null;
 function triggerContextIndexRefresh() {
   if (!fs.existsSync(CONTEXT_MEMORY_INDEXER)) return;
+  if (contextIndexChild && contextIndexChild.exitCode === null) return;
   try {
-    const child = spawn("python3", [CONTEXT_MEMORY_INDEXER, "build", "--quiet"], {
+    contextIndexChild = spawn("python3", [CONTEXT_MEMORY_INDEXER, "build", "--quiet"], {
       stdio: "ignore",
       detached: true,
     });
-    child.unref();
+    contextIndexChild.unref();
   } catch {}
 }
 
