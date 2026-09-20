@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="Ai-Context-Bridge-Icon.png" alt="AI Context Bridge icon" width="128" height="128">
+</p>
+
 # AI Context Bridge
 
 A personal AI-agent context framework. This is the glue layer I built to give my agents persistent memory, project awareness, and access to my local tools.
