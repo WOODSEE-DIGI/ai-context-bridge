@@ -45,11 +45,24 @@ The bridge has **no chat UI**. You talk to your agent; the agent calls the tools
 
 ### One-time setup
 
+**First, what you're looking at** — this repo ships *source only*:
+
+- `node_modules/` is **intentionally absent** (gitignored). It is not missing,
+  broken, or lost — `npm install` creates it from `package.json`. Never commit it.
+- Same for `package-lock.json` and any `*.bak` files: local-only, by design.
+- `package.json` is the shopping list; `node_modules/` is the groceries.
+
+**Requirements** — [Node.js](https://nodejs.org) ≥ 18 (`node --version` to check)
+and a C/C++ toolchain for `better-sqlite3` (macOS: `xcode-select --install`).
+
 ```bash
 git clone <this repo> && cd ai-context-bridge
-npm install          # better-sqlite3 is the only native dep (needs Xcode CLT)
+npm install          # creates node_modules/ — this is expected and required
 node server.js       # sanity check — it speaks MCP over stdio
 ```
+
+If `npm install` fails, the server still runs: `memory_search` degrades to a
+slower folder scan until the dependency is built. Everything else works.
 
 Register it in your MCP client:
 
