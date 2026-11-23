@@ -55,16 +55,16 @@ Everything below is written two ways: the **plain-English thing you say**, and t
 
 ### How saving to memory works
 
-Memory is addressed with **QwenURIs** (`qwen://<kind>/<path>`). The four kinds map directly onto folders in `~/.ai-context/memory/`:
+Memory is addressed with **Memory URIs** (`ctx://<kind>/<path>`). The four kinds map directly onto folders in `~/.ai-context/memory/`:
 
 | Kind | URI prefix | On-disk folder |
 |---|---|---|
-| Chat/notes | `qwen://memory/...` | `~/.ai-context/memory/conversations/` |
-| Knowledge | `qwen://knowledge/...` | `~/.ai-context/memory/knowledge/` |
-| Session/context | `qwen://context/...` | `~/.ai-context/memory/context/` |
-| Skill | `qwen://skill/...` | `~/.ai-context/memory/skills/` |
+| Chat/notes | `ctx://memory/...` | `~/.ai-context/memory/conversations/` |
+| Knowledge | `ctx://knowledge/...` | `~/.ai-context/memory/knowledge/` |
+| Session/context | `ctx://context/...` | `~/.ai-context/memory/context/` |
+| Skill | `ctx://skill/...` | `~/.ai-context/memory/skills/` |
 
-So a URI like `qwen://knowledge/projects/myapp/architecture` becomes
+So a URI like `ctx://knowledge/projects/myapp/architecture` becomes
 `~/.ai-context/memory/knowledge/projects/myapp/architecture.json` plus a companion `.md` file.
 
 Every entry also carries `project`, `type` (decision, note, session-update, fact, preference, todo, error), and `timestamp`. That is what lets you pull it back up later — by **project**, by **keyword**, or by **kind**.
@@ -78,7 +78,7 @@ The agent calls:
 ```json
 memory_write {
   "content": "Switching the inference backend to MLX.",
-  "uri": "qwen://knowledge/projects/swiftmaestro/inference-backend",
+  "uri": "ctx://knowledge/projects/swiftmaestro/inference-backend",
   "source": "chat",
   "type": "decision",
   "project": "SwiftMaestro",
@@ -90,11 +90,11 @@ memory_write {
 
 | Tool | What you say | Where it writes |
 |---|---|---|
-| `add_decision` | "Log a decision: use SQLite for storage, because it's file-first." | `qwen://knowledge/projects/<project>/decisions` |
-| `add_todo` | "Add a high-priority todo: implement the settings tab." | `qwen://knowledge/projects/<project>/todos` |
-| `report_error` | "Log an error: build failed with code 65; severity high." | `qwen://knowledge/projects/<project>/errors` |
-| `update_session` | "Note that deploy state is: v1.2 live on prod." | `qwen://context/projects/<project>/session` |
-| `set_active_project` | "Set active project to FooApp." | `qwen://context/active-project` |
+| `add_decision` | "Log a decision: use SQLite for storage, because it's file-first." | `ctx://knowledge/projects/<project>/decisions` |
+| `add_todo` | "Add a high-priority todo: implement the settings tab." | `ctx://knowledge/projects/<project>/todos` |
+| `report_error` | "Log an error: build failed with code 65; severity high." | `ctx://knowledge/projects/<project>/errors` |
+| `update_session` | "Note that deploy state is: v1.2 live on prod." | `ctx://context/projects/<project>/session` |
+| `set_active_project` | "Set active project to FooApp." | `ctx://context/active-project` |
 
 ### How recalling memory works
 
@@ -115,7 +115,7 @@ This searches every `.md`/`.json` file under `~/.ai-context/memory/` and returns
 > "Read the inference-backend decision from the SwiftMaestro project."
 
 ```json
-memory_read { "uri": "qwen://knowledge/projects/swiftmaestro/inference-backend" }
+memory_read { "uri": "ctx://knowledge/projects/swiftmaestro/inference-backend" }
 ```
 or equivalently:
 ```json
@@ -176,7 +176,7 @@ memory_index { "rebuild": true }   // force a full reindex (background for large
 
 ### Example: a full save→recall round trip
 
-1. **Save.** You tell the agent: "Record that we chose PolyForm Noncommercial as the license for the new repo." → the agent calls `add_decision` (or `memory_write`), writing `qwen://knowledge/projects/<project>/decisions`.
+1. **Save.** You tell the agent: "Record that we chose PolyForm Noncommercial as the license for the new repo." → the agent calls `add_decision` (or `memory_write`), writing `ctx://knowledge/projects/<project>/decisions`.
 2. **Later, in a different project.** You open a new session for a different repo and ask: "What license did we settle on for that new repo?" → the agent calls `memory_search { "query": "license" }`.
 3. Because `memory_search` scans the **entire** store, it finds the comment in the other project's folder, and the projects/timestamps in the result tell you where and when it was recorded.
 

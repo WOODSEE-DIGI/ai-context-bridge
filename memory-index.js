@@ -376,6 +376,10 @@ export async function createMemoryIndex({ memoryRoot: overrideRoot, indexPath } 
     const safeQuery = ftsSafe(trimmed);
     const n = Math.max(1, Math.min(Number(limit) || 20, 200));
     try {
+      // Cold index (nothing indexed yet): report "cold" via null so the
+      // caller falls back to the file-walk scan instead of claiming there
+      // are no results when we simply have not read anything yet.
+      if (indexedCount() === 0) return null;
       if (useFTS()) {
         const rows = db
           .prepare(
@@ -417,9 +421,17 @@ export async function createMemoryIndex({ memoryRoot: overrideRoot, indexPath } 
     }
   }
 
-  /** Kick off a full reindex on a worker thread (first build). No-op if warm. */
-  function ensureWarm() {
-    if (indexedCount() > 0 || warming) return;
+  /**
+   * Kick off a reindex on a worker thread. No-op if one is already running.
+   *
+   * Always off-thread: a full pass reads every file in the store (45k files /
+   * ~137 MB here), so running it synchronously stalls the event loop for
+   * seconds — which is exactly how the MCP server ended up timing out on every
+   * concurrent request. The worker reopens the DB, so the main thread's
+   * connection keeps serving reads (WAL) while it builds.
+   */
+  function startWorkerReindex() {
+    if (warming) return;
     warming = true;
     try {
       worker = new Worker(new URL(import.meta.url), {
@@ -437,28 +449,85 @@ export async function createMemoryIndex({ memoryRoot: overrideRoot, indexPath } 
         worker = null;
       });
     } catch {
-      // Worker threads unavailable — fall back to a deferred sync reindex so
-      // the current request still returns promptly.
+      // Worker threads unavailable. Leave the existing index in place rather
+      // than falling back to a synchronous rebuild — a stale-but-fast index
+      // beats blocking every MCP request for seconds.
       warming = false;
-      setTimeout(() => {
-        try { reindexSyncNow(); } catch {}
-        lastRefreshAt = Date.now();
-      }, 0);
     }
   }
 
-  /** Cheap background refresh if the cooldown has elapsed (mirrors MemorySearchService). */
+  /** Kick off a full reindex on a worker thread (first build). No-op if warm. */
+  function ensureWarm() {
+    if (indexedCount() > 0 || warming) return;
+    startWorkerReindex();
+  }
+
+  /**
+   * Background refresh if the cooldown has elapsed (mirrors MemorySearchService).
+   *
+   * Runs on the worker thread — never on the request path. Staleness is judged
+   * from the index file's own mtime rather than an in-memory timestamp, so N
+   * MCP servers running in parallel don't each rebuild the same index (they
+   * share it); only the first one to notice a stale file rebuilds, and the
+   * others see the fresh mtime and skip.
+   */
   function refreshIfStale() {
+    if (warming) return;
     const cold = indexedCount() === 0;
-    const stale = Date.now() - lastRefreshAt > refreshCooldownMs;
-    if (cold || stale) {
-      if (cold) ensureWarm();
-      else {
-        // Incremental refresh on the main thread is lightweight (mtime+size check
-        // per file, only reading changed ones) — safe to run synchronously.
-        try { reindexSyncNow(); } catch {}
-      }
+    let lastMtime = lastRefreshAt;
+    try {
+      // The worker's writes land in the -wal file, so take the newer of both.
+      const dbM = fs.statSync(dbPath).mtimeMs;
+      let walM = 0;
+      try { walM = fs.statSync(dbPath + "-wal").mtimeMs; } catch {}
+      lastMtime = Math.max(lastMtime, dbM, walM);
+    } catch {}
+    const stale = Date.now() - lastMtime > refreshCooldownMs;
+    if (cold || stale) startWorkerReindex();
+  }
+
+  /**
+   * Index just the given store-relative paths immediately (synchronous, cheap).
+   *
+   * Used right after a memory_write so a fresh entry is searchable on the very
+   * next search instead of waiting for the background refresh. Only touches the
+   * files passed in — no store walk — so it is microseconds, not seconds.
+   * Returns the number of rows actually written.
+   */
+  function indexPaths(relPaths) {
+    if (!relPaths || !relPaths.length || !db) return 0;
+    const upsert = db.prepare(`
+      INSERT INTO memory_files (path, kind, mtime, size, content)
+      VALUES (@path, @kind, @mtime, @size, @content)
+      ON CONFLICT(path) DO UPDATE SET
+        kind = excluded.kind,
+        mtime = excluded.mtime,
+        size = excluded.size,
+        content = excluded.content
+    `);
+    let written = 0;
+    for (const rel of relPaths) {
+      try {
+        const full = path.join(root, rel);
+        const st = fs.statSync(full);
+        if (!st.isFile() || st.size > MAX_FILE_SIZE) continue;
+        const content = redactor(fs.readFileSync(full, "utf8"));
+        upsert.run({ path: rel, kind: kindFor(rel), mtime: st.mtimeMs / 1000, size: st.size, content });
+        written++;
+      } catch { /* skip unreadable file */ }
     }
+    if (written) {
+      // Record the refresh so refreshIfStale doesn't immediately spawn a
+      // full worker rebuild right after we already indexed the change.
+      lastRefreshAt = Date.now();
+    }
+    return written;
+  }
+
+  /** Ask for a full reindex off-thread. Never blocks the caller. */
+  function rebuildAsync() {
+    startWorkerReindex();
+    return true;
   }
 
   return {
@@ -467,6 +536,8 @@ export async function createMemoryIndex({ memoryRoot: overrideRoot, indexPath } 
     ensureWarm,
     reindexSync: reindexSyncNow,
     refreshIfStale,
+    indexPaths,
+    rebuildAsync,
     indexPath: dbPath,
     memoryRoot: root,
   };

@@ -1,15 +1,19 @@
 {
   "name": "ai-context-bridge",
-  "version": "4.1.0",
+  "version": "4.2.0",
   "description": "MCP server for cross-project context, memory, builds, and Obsidian vault access",
   "type": "module",
   "main": "server.js",
   "license": "PolyForm-Noncommercial-1.0.0",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "node -e \"try{require('better-sqlite3');console.log('[ai-context-bridge] better-sqlite3 OK')}catch(e){console.warn('[ai-context-bridge] WARN: better-sqlite3 failed to load:',e.message);console.warn('[ai-context-bridge] Memory search will fall back to a slower file scan. Run npm rebuild better-sqlite3 if needed.')}\""
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "better-sqlite3": "^13.0.3"
+  },
+  "allowScripts": {
+    "better-sqlite3": true
   }
 }

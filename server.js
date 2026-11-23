@@ -3,7 +3,7 @@
  * AI Context Bridge — Global MCP Server v4.1
  *
  * Unified memory system + build bridge for all AI agents.
- * Memory stored at: ~/.ai-context/memory/ (QwenURI addressing)
+ * Memory stored at: ~/.ai-context/memory/ (Memory URI addressing)
  * Legacy read path: ~/.ai-context/data/ (read-only, not written to)
  */
 
@@ -12,6 +12,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { execSync, spawn, spawnSync } from "child_process";
 import fs from "fs";
+const fsp = fs.promises;
 import path from "path";
 import os from "os";
 import http from "http";
@@ -19,9 +20,8 @@ import https from "https";
 import { createMemoryIndex } from "./memory-index.js";
 
 const HOME        = os.homedir();
-// Repos live on an external volume by default (see user setup), with projects
-// nested in category folders (e.g. AI-ML-Agents/SwiftMaestro). Override the
-// root via AI_GITHUB_ROOT; fall back to a neutral Documents/GitHub path.
+// Repos live on an external volume (see user setup), with projects nested in
+// category folders (e.g. AI-ML-Agents/SwiftMaestro). Override via AI_GITHUB_ROOT.
 const GITHUB_ROOT = process.env.AI_GITHUB_ROOT
   || path.join(HOME, "Documents", "GitHub");
 const DATA_ROOT   = path.join(HOME, ".ai-context", "data");
@@ -38,6 +38,52 @@ const WHISPERKIT_STATE_DIR = process.env.WHISPERKIT_STATE_DIR || path.join(HOME,
 const WHISPERKIT_LOG_FILE = process.env.WHISPERKIT_LOG_FILE || path.join(WHISPERKIT_STATE_DIR, "transcribe.log");
 const WHISPERKIT_CURRENT_REPORT_FILE = process.env.WHISPERKIT_CURRENT_REPORT_FILE || path.join(WHISPERKIT_STATE_DIR, "current_report_path.txt");
 const CONTEXT_MEMORY_INDEXER = process.env.CONTEXT_MEMORY_INDEXER || path.join(HOME, ".ai-context", "scripts", "context-memory-index.py");
+
+// ---------------------------------------------------------------------------
+// Machine identity — cross-machine provenance.
+//
+// Every memory write is stamped with this so the resume-project skill can
+// tell which computer did the work (desktop vs laptop, etc.).
+//
+// Display name resolution, first match wins:
+//   1. ~/.ai-context/.machine-name  — explicit override (what the user calls it)
+//   2. macOS Computer Name          — friendly name from System Settings
+//   3. os.hostname()                — bare hostname
+//
+// `machine_id` is a stable UUID generated on first run so identity survives
+// hostname changes.
+// ---------------------------------------------------------------------------
+const MACHINE_NAME_FILE = path.join(HOME, ".ai-context", ".machine-name");
+const MACHINE_ID_FILE = path.join(HOME, ".ai-context", ".machine-id");
+function machineDisplayName() {
+  try {
+    if (fs.existsSync(MACHINE_NAME_FILE)) {
+      const n = fs.readFileSync(MACHINE_NAME_FILE, "utf8").trim();
+      if (n) return n;
+    }
+  } catch {}
+  try {
+    const n = execSync("scutil --get ComputerName", { encoding: "utf8", timeout: 2000 }).trim();
+    if (n) return n;
+  } catch {}
+  return os.hostname();
+}
+function loadMachineId() {
+  try {
+    if (fs.existsSync(MACHINE_ID_FILE)) {
+      const id = fs.readFileSync(MACHINE_ID_FILE, "utf8").trim();
+      if (id) return id;
+    }
+  } catch {}
+  const id = crypto.randomUUID();
+  try {
+    ensureDir(path.dirname(MACHINE_ID_FILE));
+    fs.writeFileSync(MACHINE_ID_FILE, id + "\n", "utf8");
+  } catch {}
+  return id;
+}
+const MACHINE_HOSTNAME = machineDisplayName();
+const MACHINE_ID = loadMachineId();
 
 function ensureDir(dir) { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); }
 // Convert a glob (*, **, ?) to an anchored RegExp for matching file paths.
@@ -57,16 +103,69 @@ function globToRegex(glob) {
   return new RegExp("^" + re + "$");
 }
 let contextIndexChild = null;
+// Cross-process lock for the background indexer. The old guard was
+// `contextIndexChild.exitCode === null`, which is per-process: three MCP
+// server processes spawned three concurrent `context-memory-index.py build`
+// runs, each pegging a core in an lstat storm over the iCloud-backed store.
+// A lock file gives us a single system-wide builder. Stale locks (crashed
+// builder) are broken after INDEX_LOCK_STALE_MS.
+const INDEX_LOCK_FILE = path.join(os.tmpdir(), "ai-context-memory-index.lock");
+const INDEX_LOCK_STALE_MS = 30 * 60 * 1000;
+// Index artifact produced by context-memory-index.py (see its SEARCH_DB_PATH).
+const INDEX_DB_FILE = path.join(DATA_ROOT, "index", "memory_search.sqlite");
+// Minimum age before a write is allowed to trigger a rebuild. Rebuilds take
+// minutes and the in-process search path doesn't use the index at all, so
+// rebuilding on every write is pure cost.
+const INDEX_REBUILD_MIN_INTERVAL_MS = 30 * 60 * 1000;
+
+function acquireIndexLock() {
+  try {
+    // 'wx' fails if the file exists → atomic across processes.
+    const fd = fs.openSync(INDEX_LOCK_FILE, "wx");
+    fs.writeSync(fd, String(process.pid));
+    fs.closeSync(fd);
+    return true;
+  } catch (e) {
+    if (e.code !== "EEXIST") return false;
+    try {
+      const age = Date.now() - fs.statSync(INDEX_LOCK_FILE).mtimeMs;
+      if (age > INDEX_LOCK_STALE_MS) {
+        fs.unlinkSync(INDEX_LOCK_FILE);
+        return acquireIndexLock();
+      }
+    } catch {}
+    return false;
+  }
+}
+
 function triggerContextIndexRefresh() {
   if (!fs.existsSync(CONTEXT_MEMORY_INDEXER)) return;
   if (contextIndexChild && contextIndexChild.exitCode === null) return;
+  // The in-process SQLite FTS index (memory-index.js) is what memory_search
+  // uses; this separate Python index only serves the CLI `search` command and
+  // chat-context-warmup. Throttle by index age so a burst of writes doesn't
+  // queue repeated multi-minute rebuilds.
+  try {
+    const idx = fs.statSync(INDEX_DB_FILE);
+    if (Date.now() - idx.mtimeMs < INDEX_REBUILD_MIN_INTERVAL_MS) return;
+  } catch {} // no index yet → fall through and build
+  if (!acquireIndexLock()) return; // another process is already building
+  let spawned = false;
   try {
     contextIndexChild = spawn("python3", [CONTEXT_MEMORY_INDEXER, "build", "--quiet"], {
       stdio: "ignore",
       detached: true,
     });
-    contextIndexChild.unref();
+    spawned = true;
+    const child = contextIndexChild;
+    child.on("exit", () => {
+      try { fs.unlinkSync(INDEX_LOCK_FILE); } catch {}
+    });
+    child.unref();
   } catch {}
+  if (!spawned) {
+    try { fs.unlinkSync(INDEX_LOCK_FILE); } catch {}
+  }
 }
 
 function activeProject() {
@@ -171,7 +270,7 @@ function readSwiftMaestroAPIKey() {
   }
   return "";
 }
-const PAL_BASE_URL = (process.env.PAL_BASE_URL || "http://127.0.0.1:1235").replace(/\/+$/, "");
+const PAL_BASE_URL = "http://192.168.10.207:1235";
 const PAL_BEARER_TOKEN =
   process.env.PAL_BEARER_TOKEN ||
   readKeychainSecret("PAL_BEARER_TOKEN", "pal-mcp") ||
@@ -434,36 +533,77 @@ function memoryDir(kind, subpath) {
   ensureDir(base);
   return subpath ? path.join(base, ...subpath.split("/").filter(Boolean)) : base;
 }
-function parseQwenURI(uri) {
-  if (!uri || !uri.startsWith("qwen://")) return null;
-  const body = uri.slice(7);
+function parseMemoryURI(uri) {
+  // Canonical scheme is ctx://. Legacy qwen:// URIs remain readable so that
+  // existing references and older client prompts keep working.
+  if (!uri || typeof uri !== "string") return null;
+  let body = null;
+  if (uri.startsWith("ctx://")) body = uri.slice(6);
+  else if (uri.startsWith("qwen://")) body = uri.slice(7); // legacy scheme, read-only
+  if (body === null) return null;
   const parts = body.split("/").filter(Boolean);
   const kind = parts[0];
   if (!MEMORY_KINDS[kind]) return null;
   return { kind, path: parts.slice(1) };
+}
+function canonicalUri(u) {
+  // Stored entries written before the scheme rename still carry qwen:// in
+  // their stored "uri" field. Normalize on output so clients only ever see
+  // the canonical ctx:// scheme (input still accepts both via parseMemoryURI).
+  return typeof u === "string" && u.startsWith("qwen://") ? "ctx://" + u.slice(7) : u;
+}
+function canonicalScheme(text) {
+  // Normalize EVERY qwen:// occurrence in outbound text: stored "uri" fields,
+  // MD frontmatter (URI: ...) and bare occurrences in prose (README tables,
+  // quoted examples). qwen:// only ever meant the retired URI scheme, so a
+  // blanket replace cannot corrupt any other meaning — and it guarantees no
+  // legacy scheme reaches a client regardless of how an entry was authored.
+  if (typeof text !== "string") return text;
+  return text.replace(/qwen:\/\//g, "ctx://");
 }
 function memoryEntryPath(kind, entryPath) {
   const dir = memoryDir(kind, entryPath);
   ensureDir(path.dirname(dir));
   return dir;
 }
+function safeAppendFileSync(filePath, content, retries = 5) {
+  // iCloud Drive can transiently reject O_APPEND writes with EAGAIN/EDEADLK.
+  // Read existing content, append in memory, then write back with retries.
+  let lastErr;
+  for (let i = 0; i < retries; i++) {
+    try {
+      let existing = "";
+      if (fs.existsSync(filePath)) { existing = fs.readFileSync(filePath, "utf8"); }
+      fs.writeFileSync(filePath, existing + content, "utf8");
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (i < retries - 1) {
+        const delay = 100 * Math.pow(2, i);
+        const start = Date.now();
+        while (Date.now() - start < delay) {} // synchronous backoff
+      }
+    }
+  }
+  throw lastErr;
+}
 function writeMemoryEntry(entry) {
   const id = entry.id || crypto.randomUUID();
   const ts = entry.timestamp || new Date().toISOString();
-  const uri = entry.uri || `qwen://${entry.kind}/${entry.path || ""}`;
-  const parsed = parseQwenURI(uri);
+  const uri = entry.uri || `ctx://${entry.kind}/${entry.path || ""}`;
+  const parsed = parseMemoryURI(uri);
   const kind = parsed ? parsed.kind : (entry.kind || "knowledge");
   const subpath = parsed ? parsed.path.join("/") : (entry.path || "");
   const basePath = memoryEntryPath(kind, subpath);
   // Write JSON
-  const jsonData = { id, uri, source: entry.source || "unknown", timestamp: ts, type: entry.type || "note", project: entry.project || "global", content: entry.content, tags: entry.tags || [] };
+  const jsonData = { id, uri, source: entry.source || "unknown", machine: MACHINE_HOSTNAME, machine_id: MACHINE_ID, timestamp: ts, type: entry.type || "note", project: entry.project || "global", content: entry.content, tags: entry.tags || [] };
   const jsonFile = basePath.endsWith(".json") ? basePath : basePath + ".json";
   ensureDir(path.dirname(jsonFile));
   fs.writeFileSync(jsonFile, JSON.stringify(jsonData, null, 2), "utf8");
   // Write companion MD
   const mdFile = jsonFile.replace(/\.json$/, ".md");
-  const mdContent = `\n---\nFROM: ${entry.source || "unknown"}\nTIMESTAMP: ${ts}\nPROJECT: ${entry.project || "global"}\nTYPE: ${entry.type || "note"}\nURI: ${uri}\n---\n\n${entry.content}\n`;
-  fs.appendFileSync(mdFile, mdContent, "utf8");
+  const mdContent = `\n---\nFROM: ${entry.source || "unknown"}\nMACHINE: ${MACHINE_HOSTNAME}\nTIMESTAMP: ${ts}\nPROJECT: ${entry.project || "global"}\nTYPE: ${entry.type || "note"}\nURI: ${uri}\n---\n\n${entry.content}\n`;
+  safeAppendFileSync(mdFile, mdContent);
   triggerContextIndexRefresh();
   return { id, uri, jsonFile, mdFile };
 }
@@ -484,17 +624,58 @@ function readMemoryEntry(kind, subpath) {
   }
   return jsonData || { content: mdData, kind, path: subpath };
 }
-function searchMemoryFiles(query, maxResults = 20) {
+// Memory store walks are BUDGETED and ASYNC.
+//
+// The store has 13k+ JSON files behind `~/.ai-context/memory`, an iCloud
+// symlink whose dataless files stall on materialisation. The previous sync
+// `readdirSync`/`readFileSync` walkers took 30s+ and, because they ran on the
+// event loop, timed out EVERY concurrent MCP request (memory_write,
+// add_decision, list_skills…). Async iteration + a wall-clock budget keeps the
+// server responsive; a walk that runs out of budget reports `truncated` so
+// callers can say results are partial instead of silently wrong.
+const MEMORY_WALK_BUDGET_MS = 5000;
+// Search reads whole file bodies (list only parses metadata), and callers
+// expect real hits rather than "partial" noise — give it a longer budget.
+// Only reached when the FTS index is cold; see memory-index.js.
+const MEMORY_SEARCH_BUDGET_MS = 15000;
+
+// Newest-first ordering. The store contains ~45k crawled doc pages under
+// `knowledge/projects/SwiftMaestro/docs/`; an alphabetical walk burns the whole
+// budget there and never reaches recent writes. Sorting directories by mtime
+// descending puts freshly-written project memory first, so a truncated walk
+// still returns the most relevant (newest) matches.
+async function byNewestFirst(dirents, parentDir) {
+  const dirs = [];
+  const files = [];
+  for (const e of dirents) {
+    if (e.name.startsWith(".") || e.name === "index") continue;
+    (e.isDirectory() ? dirs : files).push(e);
+  }
+  const withMtime = await Promise.all(dirs.map(async (e) => {
+    let mtimeMs = 0;
+    try { mtimeMs = (await fsp.stat(path.join(parentDir, e.name))).mtimeMs; } catch {}
+    return { e, mtimeMs };
+  }));
+  withMtime.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return { dirs: withMtime.map(x => x.e), files };
+}
+
+async function searchMemoryFiles(query, maxResults = 20) {
   const q = query.toLowerCase();
   const matches = [];
-  function walk(dir) {
-    if (matches.length >= maxResults || !fs.existsSync(dir)) return;
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (e.name.startsWith(".") || e.name === "index") continue;
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) { walk(full); continue; }
+  const deadline = Date.now() + MEMORY_SEARCH_BUDGET_MS;
+  let truncated = false;
+  async function walk(dir) {
+    if (matches.length >= maxResults || truncated) return;
+    let dirents;
+    try { dirents = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+    const { dirs, files } = await byNewestFirst(dirents, dir);
+    for (const e of files) {
+      if (matches.length >= maxResults) return;
+      if (Date.now() > deadline) { truncated = true; return; }
       if (!e.name.endsWith(".md") && !e.name.endsWith(".json")) continue;
-      let content; try { content = fs.readFileSync(full, "utf8"); } catch { continue; }
+      const full = path.join(dir, e.name);
+      let content; try { content = await fsp.readFile(full, "utf8"); } catch { continue; }
       if (content.toLowerCase().includes(q)) {
         const rel = path.relative(MEMORY_ROOT, full);
         const lines = content.split("\n");
@@ -503,42 +684,58 @@ function searchMemoryFiles(query, maxResults = 20) {
         matches.push({ file: rel, line: matchLine + 1, snippet: snippet.slice(0, 500) });
       }
     }
+    for (const e of dirs) {
+      if (matches.length >= maxResults || truncated) return;
+      if (Date.now() > deadline) { truncated = true; return; }
+      await walk(path.join(dir, e.name));
+    }
   }
-  walk(MEMORY_ROOT);
-  return matches;
+  await walk(MEMORY_ROOT);
+  return { matches, truncated };
 }
-function listMemoryEntries(kind, project) {
+async function listMemoryEntries(kind, project, pathPrefix, limit = 50, offset = 0) {
   const dir = memoryDir(kind);
-  if (!fs.existsSync(dir)) return [];
+  if (!fs.existsSync(dir)) return { total: 0, entries: [], truncated: false };
   const entries = [];
-  function walk(d, prefix) {
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+  const prefix = pathPrefix ? pathPrefix.replace(/\/$/, "") : "";
+  const deadline = Date.now() + MEMORY_WALK_BUDGET_MS;
+  let truncated = false;
+  async function walk(d, prefixRel) {
+    if (truncated) return;
+    let dirents;
+    try { dirents = await fsp.readdir(d, { withFileTypes: true }); } catch { return; }
+    for (const e of dirents) {
+      if (Date.now() > deadline) { truncated = true; return; }
       if (e.name.startsWith(".") || e.name === "index") continue;
-      const rel = prefix ? `${prefix}/${e.name}` : e.name;
-      if (e.isDirectory()) { walk(path.join(d, e.name), rel); continue; }
+      const rel = prefixRel ? `${prefixRel}/${e.name}` : e.name;
+      if (e.isDirectory()) { await walk(path.join(d, e.name), rel); continue; }
       if (!e.name.endsWith(".json")) continue;
+      if (prefix && !rel.startsWith(prefix + "/")) continue;
       try {
-        const data = JSON.parse(fs.readFileSync(path.join(d, e.name), "utf8"));
+        const data = JSON.parse(await fsp.readFile(path.join(d, e.name), "utf8"));
         if (project && data.project !== project && data.project !== "global") continue;
-        entries.push({ uri: data.uri || `qwen://${kind}/${rel.replace(/\.json$/, "")}`, type: data.type, project: data.project, timestamp: data.timestamp, tags: data.tags });
+        entries.push({ uri: canonicalUri(data.uri) || `ctx://${kind}/${rel.replace(/\.json$/, "")}`, type: data.type, project: data.project, timestamp: data.timestamp, tags: data.tags });
       } catch {}
     }
   }
-  walk(dir, "");
-  return entries.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
+  await walk(dir, "");
+  const sorted = entries.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
+  const total = sorted.length;
+  const cappedLimit = Math.min(Math.max(1, limit), 200);
+  const start = Math.max(0, Math.min(offset, total));
+  return { total, entries: sorted.slice(start, start + cappedLimit), truncated };
 }
 
 import crypto from "crypto";
 
-// --- SQLite FTS5 memory index (adopted from SwiftMaestro MemorySearchEngine) ---
-//
-// A derived SQLite FTS5 search index over the shared ~/.ai-context/memory store.
-// It turns the file-walking `searchMemoryFiles` scan into a sub-millisecond FTS
-// query. `memory_index` is null when better-sqlite3 isn't installed or the index
-// can't be built — `memory_search` then transparently falls back to the file-walk.
+// ---------------------------------------------------------------------------
+// SQLite FTS5 memory index (derived cache over the memory store)
+// ---------------------------------------------------------------------------
+
 let memoryIndex = null;
 let memoryIndexStarted = false;
 
+/** Create the index once and kick off the background build. Idempotent. */
 async function startMemoryIndex() {
   if (memoryIndexStarted) return;
   memoryIndexStarted = true;
@@ -553,7 +750,7 @@ async function startMemoryIndex() {
   }
 }
 
-/** Best-effort: keep the index fresh within its cooldown (mirrors SwiftMaestro). */
+/** Best-effort: keep the index fresh within its cooldown (off-thread). */
 function refreshMemoryIndex() {
   if (!memoryIndex) return;
   try { memoryIndex.refreshIfStale(); } catch {}
@@ -562,6 +759,26 @@ function refreshMemoryIndex() {
 /** True once the index has rows; before that, memory_search falls back to file-walk. */
 function isMemoryIndexReady() {
   return !!memoryIndex && memoryIndex.indexedCount() > 0;
+}
+
+/**
+ * Index specific absolute files that were just written (microseconds — no
+ * store walk), so a fresh memory_write is visible to the next memory_search.
+ */
+function indexWrittenFiles(absPaths) {
+  if (!memoryIndex) return;
+  try {
+    const root = memoryIndex.memoryRoot; // realpath of ~/.ai-context/memory (symlink)
+    const rels = absPaths
+      .filter(Boolean)
+      .map(p => {
+        // Resolve symlinks first: MEMORY_ROOT is a link into iCloud, so a
+        // naive path.relative() would yield "../../*" and be discarded.
+        try { return path.relative(root, fs.realpathSync(p)); } catch { return null; }
+      })
+      .filter(rel => rel && !rel.startsWith("..") && !path.isAbsolute(rel));
+    if (rels.length) memoryIndex.indexPaths(rels);
+  } catch { /* best-effort */ }
 }
 
 const server = new Server({ name: "ai-context-bridge", version: "4.0.0" }, { capabilities: { tools: {} } });
@@ -576,7 +793,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
   { name: "read_file", description: "Read a source file from any project.", inputSchema: { type: "object", required: ["filepath"], properties: { project: { type: "string" }, filepath: { type: "string" } } } },
   { name: "write_file", description: "Create, overwrite, or append a file at any host path (absolute, or relative to a project repo via the project arg). Creates parent directories. Use for writing code, config, or any text file.", inputSchema: { type: "object", required: ["filepath", "content"], properties: { filepath: { type: "string" }, content: { type: "string" }, append: { type: "boolean", description: "Append instead of overwrite (default false)." }, project: { type: "string" } } } },
   { name: "edit_file", description: "Exact string replacement in a file. Replaces the first occurrence of `search` with `replace` (set replace_all:true for every occurrence). Errors if `search` is not found, or appears multiple times while replace_all is false — include enough surrounding context to make `search` unique.", inputSchema: { type: "object", required: ["filepath", "search", "replace"], properties: { filepath: { type: "string" }, search: { type: "string" }, replace: { type: "string" }, replace_all: { type: "boolean" }, project: { type: "string" } } } },
-  { name: "list_dir", description: "List files and folders in a directory (absolute, or relative to a project repo via the project arg).", inputSchema: { type: "object", required: ["path"], properties: { path: { type: "string" }, project: { type: "string" } } } },
+  { name: "list_dir", description: "List ALL files and folders in a directory (absolute, or relative to a project repo via the project arg). Returns every entry — do NOT filter or skip. For large directories, prefer index_directory instead — it gives a structured tree with macOS Spotlight metadata (file types, sizes, dates) without reading any file contents.", inputSchema: { type: "object", required: ["path"], properties: { path: { type: "string" }, project: { type: "string" } } } },
+  { name: "index_directory", description: "Recursively scan a directory and return a structured index of ALL files and subdirectories. Uses macOS Spotlight metadata (mdls) for rich info — file types, sizes, dates, dimensions, page counts — WITHOUT reading file contents. This is the FASTEST way to understand a directory's contents. ALWAYS prefer this over calling list_dir repeatedly when you need to understand a directory. After indexing, call save_index to persist results to shared memory.", inputSchema: { type: "object", required: ["path"], properties: { path: { type: "string", description: "Absolute path to the directory to index." }, depth: { type: "number", description: "Max recursion depth (0 = top-level only, default = unlimited)." }, include_metadata: { type: "boolean", description: "Include Spotlight metadata (default true). Set false for a fast name-only scan." } } } },
+  { name: "save_index", description: "Save a directory index to the unified shared memory store so it persists across sessions and is visible to all agents. Use after index_directory to preserve results.", inputSchema: { type: "object", required: ["index", "name"], properties: { index: { type: "string", description: "The index content to save." }, name: { type: "string", description: "A name for this index (e.g. 'mystory-backend-index')." }, project: { type: "string", description: "Optional project to scope the index to." } } } },
+  { name: "spotlight_search", description: "Fast macOS Spotlight search (mdfind) for files matching a query within a directory. Much faster than walking the filesystem for large directories. Returns matching file paths. Query uses Spotlight syntax — e.g. 'kMDItemContentType == public.image' or 'filename == *.swift'.", inputSchema: { type: "object", required: ["query"], properties: { query: { type: "string", description: "Spotlight query string (mdfind syntax)." }, directory: { type: "string", description: "Directory to search within (absolute path). Default: entire system." }, max_results: { type: "number", description: "Max results to return (default 200)." } } } },
   { name: "grep_code", description: "Search file contents by regex under a directory (ripgrep-backed) and return file:line: match. Respects common ignore dirs (.git, node_modules, DerivedData, .build) and .gitignore. Prefer this over execute_command for code search. To target a specific repo, pass project (e.g. 'SwiftMaestro') and a repo-relative path like 'Sources', OR pass an absolute path.", inputSchema: { type: "object", required: ["pattern"], properties: { pattern: { type: "string", description: "Regex (ERE) to search for." }, path: { type: "string", description: "Directory to search: an ABSOLUTE path, or relative to the given project's repo. Default: whole GitHub tree." }, file_glob: { type: "string", description: "Optional file filter, e.g. '*.swift'." }, ignore_case: { type: "boolean" }, max_results: { type: "number" }, project: { type: "string", description: "Repo name to scope to, e.g. 'SwiftMaestro'." } } } },
   { name: "glob_files", description: "Find files by name/glob pattern under a directory. Returns matching file paths. Supports *, **, ?. To target a specific repo, pass project (e.g. 'SwiftMaestro') and a repo-relative path, OR pass an absolute path.", inputSchema: { type: "object", required: ["pattern"], properties: { pattern: { type: "string", description: "Glob like '*.swift' or '**/Model*.ts'." }, path: { type: "string", description: "Root to search: an ABSOLUTE path, or relative to the given project's repo. Default: whole GitHub tree." }, max_depth: { type: "number" }, max_results: { type: "number" }, project: { type: "string", description: "Repo name to scope to, e.g. 'SwiftMaestro'." } } } },
   { name: "search_conversation_history", description: "Full-text search across SwiftMaestro's past chat histories (all agents). Returns matching messages with the agent name, role, and a snippet. Use to recall earlier discussion.", inputSchema: { type: "object", required: ["query"], properties: { query: { type: "string" }, max_results: { type: "number" } } } },
@@ -586,22 +806,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
   { name: "report_error", description: "Log an error to the unified memory store.", inputSchema: { type: "object", required: ["error"], properties: { project: { type: "string" }, error: { type: "string" }, context: { type: "string" }, severity: { type: "string", enum: ["low","medium","high","critical"] } } } },
   { name: "update_session", description: "Update session context in the unified memory store.", inputSchema: { type: "object", required: ["key","value"], properties: { project: { type: "string" }, key: { type: "string" }, value: { type: "string" } } } },
   { name: "add_todo", description: "Add a task to the unified memory store.", inputSchema: { type: "object", required: ["task"], properties: { project: { type: "string" }, task: { type: "string" }, priority: { type: "string", enum: ["low","medium","high"] }, assignee: { type: "string" } } } },
+  { name: "update_sync_state", description: "Record cross-machine sync state for a project: which machine last worked on it, last commit, branch, in-progress note. Read back with memory_read (uri: ctx://context/projects/<name>/sync-state). Used by the resume-project skill to detect divergence between machines.", inputSchema: { type: "object", required: ["project"], properties: { project: { type: "string" }, last_commit: { type: "string", description: "Latest commit hash/subject observed on this machine." }, branch: { type: "string" }, in_progress: { type: "string", description: "One-line description of what is currently being worked on." }, dirty: { type: "boolean", description: "Whether the working tree has uncommitted changes." }, note: { type: "string", description: "Optional extra context for the next machine." } } } },
   { name: "list_active_contexts", description: "List all projects with memory entries in the unified store.", inputSchema: { type: "object", properties: {} } },
   { name: "list_vault", description: "List notes/folders in the Obsidian vault.", inputSchema: { type: "object", properties: { subfolder: { type: "string" }, depth: { type: "number" } } } },
   { name: "search_vault", description: "Full-text search across all Obsidian vault notes.", inputSchema: { type: "object", required: ["query"], properties: { query: { type: "string" }, max_results: { type: "number" } } } },
   { name: "read_note", description: "Read a note from the Obsidian vault.", inputSchema: { type: "object", required: ["filepath"], properties: { filepath: { type: "string" } } } },
-  { name: "write_note", description: "Create, overwrite, or append a note file in any Obsidian vault under ~/Obsidian. Works across all vaults regardless of which one the Local REST API is serving. filepath is relative to ~/Obsidian (e.g. 'Tech Configs/Network Settings/router.md') or an absolute path inside it. Parent folders are created automatically; Obsidian picks up the change live.", inputSchema: { type: "object", required: ["filepath", "content"], properties: { filepath: { type: "string", description: "Vault-relative path (under ~/Obsidian), e.g. 'OSINTIAN/Notes/foo.md'." }, content: { type: "string" }, append: { type: "boolean", description: "Append to the file instead of overwriting (default false)." } } } },
+  { name: "write_note", description: "Create, overwrite, or append a note file in any Obsidian vault under ~/Obsidian. Works across all vaults regardless of which one the Local REST API is serving. filepath is relative to ~/Obsidian (e.g. 'Tech Configs/Network Settings/router.md') or an absolute path inside it. Parent folders are created automatically; Obsidian picks up the change live.", inputSchema: { type: "object", required: ["filepath", "content"], properties: { filepath: { type: "string", description: "Vault-relative path (under ~/Obsidian), e.g. 'MyVault/Notes/foo.md'." }, content: { type: "string" }, append: { type: "boolean", description: "Append to the file instead of overwriting (default false)." } } } },
   { name: "read_notes", description: "Read MULTIPLE Obsidian notes in ONE call. Strongly prefer this over many separate read_note calls when you need several files (e.g. summarizing a folder) — it is far faster. Each path is relative to ~/Obsidian or absolute within it.", inputSchema: { type: "object", required: ["filepaths"], properties: { filepaths: { type: "array", items: { type: "string" }, description: "List of vault-relative note paths to read." } } } },
   { name: "execute_command", description: "Execute a shell command on the host macOS system. Long-running commands are allowed (default 10 min timeout; pass timeout_ms or 0 to disable).", inputSchema: { type: "object", required: ["command"], properties: { command: { type: "string", description: "The shell command to execute." }, cwd: { type: "string", description: "Optional working directory." }, timeout_ms: { type: "number", description: "Max run time in ms (default 600000; 0 = no timeout)." } } } },
   { name: "obsidian_rest_health", description: "Check Obsidian Local REST API connectivity/authentication.", inputSchema: { type: "object", properties: {} } },
   { name: "obsidian_rest_request", description: "Make a direct request to Obsidian Local REST API for vault automation.", inputSchema: { type: "object", required: ["path"], properties: { path: { type: "string" }, method: { type: "string" }, content_type: { type: "string" }, body: {}, headers: { type: "object", additionalProperties: { type: "string" } } } } },
   { name: "whisperkit_transcribe_control", description: "Control local WhisperKit stream transcription using the switch script.", inputSchema: { type: "object", required: ["action"], properties: { action: { type: "string", enum: ["start","stop","status","repair","toggle"] } } } },
   { name: "whisperkit_transcribe_snapshot", description: "Read recent live text and file tails from WhisperKit transcription logs/reports.", inputSchema: { type: "object", properties: { max_log_lines: { type: "number" }, max_live_items: { type: "number" }, max_report_lines: { type: "number" } } } },
-  { name: "memory_write", description: "Write a memory entry to the unified shared memory store. All tools (Warp, Qwen Code, QwenAgent, LM Studio) share this store.", inputSchema: { type: "object", required: ["content"], properties: { uri: { type: "string", description: "QwenURI e.g. qwen://knowledge/projects/myapp/architecture" }, kind: { type: "string", enum: ["memory","knowledge","context","skill"], description: "Memory kind (if no URI provided)" }, path: { type: "string", description: "Sub-path within kind (if no URI provided)" }, content: { type: "string" }, source: { type: "string", description: "Who is writing (e.g. warp-oz, qwen-code, user)" }, type: { type: "string", description: "Entry type: decision, note, session-update, fact, preference" }, project: { type: "string" }, tags: { type: "array", items: { type: "string" } } } } },
-  { name: "memory_read", description: "Read a memory entry by QwenURI or kind+path from the unified shared memory store.", inputSchema: { type: "object", properties: { uri: { type: "string", description: "QwenURI e.g. qwen://knowledge/decisions" }, kind: { type: "string", enum: ["memory","knowledge","context","skill"] }, path: { type: "string" } } } },
+  { name: "memory_write", description: "Write a memory entry to the unified shared memory store. Every client connected to this bridge shares the same store.", inputSchema: { type: "object", required: ["content"], properties: { uri: { type: "string", description: "Memory URI e.g. ctx://knowledge/projects/myapp/architecture" }, kind: { type: "string", enum: ["memory","knowledge","context","skill"], description: "Memory kind (if no URI provided)" }, path: { type: "string", description: "Sub-path within kind (if no URI provided)" }, content: { type: "string" }, source: { type: "string", description: "Who is writing (e.g. warp-oz, opencode, user)" }, type: { type: "string", description: "Entry type: decision, note, session-update, fact, preference" }, project: { type: "string" }, tags: { type: "array", items: { type: "string" } } } } },
+  { name: "memory_read", description: "Read a memory entry by Memory URI or kind+path from the unified shared memory store.", inputSchema: { type: "object", properties: { uri: { type: "string", description: "Memory URI e.g. ctx://knowledge/decisions" }, kind: { type: "string", enum: ["memory","knowledge","context","skill"] }, path: { type: "string" } } } },
   { name: "memory_search", description: "Full-text search across the entire unified shared memory store.", inputSchema: { type: "object", required: ["query"], properties: { query: { type: "string" }, max_results: { type: "number" } } } },
-  { name: "memory_list", description: "List memory entries by kind, optionally filtered by project.", inputSchema: { type: "object", properties: { kind: { type: "string", enum: ["memory","knowledge","context","skill"] }, project: { type: "string" } } } },
-  { name: "memory_index", description: "Inspect or rebuild the SQLite FTS5 memory search index. Returns the index path, memory root, indexed file count, and whether it is ready. Pass rebuild:true to force a full reindex (runs in the background for large stores).", inputSchema: { type: "object", properties: { rebuild: { type: "boolean", description: "Force a full reindex (default false)." } } } }
+  { name: "memory_list", description: "List a small page of memory entry paths (metadata only). Prefer memory_search for finding specific content. Default limit is 50; use offset to paginate.", inputSchema: { type: "object", properties: { kind: { type: "string", enum: ["memory","knowledge","context","skill"], description: "Namespace to list. Defaults to 'knowledge'." }, project: { type: "string", description: "Filter by project." }, path: { type: "string", description: "Optional path prefix (e.g. 'projects/SwiftMaestro')." }, limit: { type: "number", description: "Max entries to return (default 50, max 200)." }, offset: { type: "number", description: "Skip this many entries for pagination." } } } },
+  { name: "memory_index", description: "Inspect or rebuild the SQLite FTS5 memory search index. Returns the index path, memory root, indexed file count, and whether it is ready. Pass rebuild:true to force a reindex (runs off-thread in the background).", inputSchema: { type: "object", properties: { rebuild: { type: "boolean", description: "Force a full reindex (default false)." } } } },
 ]}));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -626,7 +847,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: `GitHub projects (${projects.length}):\n${projects.join("\n")}${active ? `\n\n→ Active: ${active}` : ""}` }] };
       }
       case "set_active_project": {
-        writeMemoryEntry({ uri: `qwen://context/active-project`, content: args.project, source: "user", type: "session-update", project: args.project, tags: ["active-project"] });
+        const result = writeMemoryEntry({ uri: `ctx://context/active-project`, content: args.project, source: "user", type: "session-update", project: args.project, tags: ["active-project"] });
+        indexWrittenFiles([result.jsonFile, result.mdFile]);
         return { content: [{ type: "text", text: `✓ Active project: ${args.project}` }] };
       }
       case "build_project":
@@ -726,6 +948,164 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           .sort((a, b) => a.name.localeCompare(b.name))
           .map(e => e.isDirectory() ? `[DIR]  ${e.name}/` : `[FILE] ${e.name}`);
         return { content: [{ type: "text", text: `${dir} (${entries.length}):\n${entries.join("\n") || "(empty)"}` }] };
+      }
+      case "index_directory": {
+        let dir = args?.path;
+        if (!dir) return { content: [{ type: "text", text: "Error: path is required" }], isError: true };
+        if (!path.isAbsolute(dir)) dir = path.join(projectRoot(resolveProject(args)), dir);
+        if (!fs.existsSync(dir)) return { content: [{ type: "text", text: `Not found: ${dir}` }], isError: true };
+        const maxDepth = args?.depth != null ? Number(args.depth) : -1;
+        const includeMeta = args?.include_metadata !== false;
+        let fileCount = 0, dirCount = 0, totalSize = 0;
+        const treeLines = [];
+        const fileTypes = {};
+
+        function formatBytes(b) {
+          if (b < 1024) return `${b} B`;
+          if (b < 1024*1024) return `${(b/1024).toFixed(1)} KB`;
+          if (b < 1024*1024*1024) return `${(b/(1024*1024)).toFixed(1)} MB`;
+          return `${(b/(1024*1024*1024)).toFixed(1)} GB`;
+        }
+
+        function fileIcon(name) {
+          const ext = path.extname(name).toLowerCase();
+          const icons = {
+            '.swift': '📄', '.m': '', '.h': '📄', '.py': '📄', '.js': '', '.ts': '📄',
+            '.json': '📋', '.yaml': '📋', '.yml': '', '.xml': '📋',
+            '.md': '📝', '.markdown': '📝', '.txt': '📝',
+            '.pdf': '📕', '.png': '🖼️', '.jpg': '🖼️', '.jpeg': '🖼️', '.gif': '🖼️',
+            '.webp': '🖼️', '.heic': '🖼️', '.tiff': '🖼️',
+            '.mp4': '🎬', '.mov': '🎬', '.mp3': '', '.wav': '🎵',
+            '.zip': '📦', '.tar': '📦', '.gz': '📦', '.dmg': '📦',
+            '.db': '🗄️', '.sqlite': '🗄️', '.sql': '️',
+          };
+          return icons[ext] || '📄';
+        }
+
+        function getSpotlightMeta(fullPath) {
+          if (!includeMeta) return null;
+          try {
+            const r = spawnSync("mdls", ["-raw",
+              "-name", "kMDItemContentType", "-name", "kMDItemKind",
+              "-name", "kMDItemFSSize", "-name", "kMDItemContentModificationDate",
+              "-name", "kMDItemPixelHeight", "-name", "kMDItemPixelWidth",
+              "-name", "kMDItemDurationSeconds", "-name", "kMDItemPageCount",
+              "-name", "kMDItemWordCount",
+              fullPath
+            ], { encoding: "utf8", timeout: 5000 });
+            if (r.status !== 0 || !r.stdout) return null;
+            const meta = {};
+            for (const line of r.stdout.split("\n")) {
+              if (!line || line === "(null)") continue;
+              if (line.startsWith("kMDItemContentType = ")) meta.contentType = line.slice(21);
+              else if (line.startsWith("kMDItemKind = ")) meta.kind = line.slice(15);
+              else if (line.startsWith("kMDItemFSSize = ")) meta.size = parseInt(line.slice(17));
+              else if (line.startsWith("kMDItemContentModificationDate = ")) meta.modified = line.slice(36);
+              else if (line.startsWith("kMDItemPixelHeight = ")) meta.pixelH = parseInt(line.slice(21));
+              else if (line.startsWith("kMDItemPixelWidth = ")) meta.pixelW = parseInt(line.slice(20));
+              else if (line.startsWith("kMDItemDurationSeconds = ")) meta.duration = parseFloat(line.slice(26));
+              else if (line.startsWith("kMDItemPageCount = ")) meta.pages = parseInt(line.slice(19));
+              else if (line.startsWith("kMDItemWordCount = ")) meta.words = parseInt(line.slice(19));
+            }
+            let summary = meta.kind || meta.contentType || "";
+            if (meta.size != null) summary += ` ${formatBytes(meta.size)}`;
+            if (meta.pixelW && meta.pixelH) summary += ` [${meta.pixelW}x${meta.pixelH}]`;
+            if (meta.duration != null) {
+              const m = Math.floor(meta.duration / 60);
+              const s = Math.floor(meta.duration % 60);
+              summary += ` [${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}]`;
+            }
+            if (meta.pages) summary += ` (${meta.pages} pages)`;
+            if (meta.words) summary += ` (${meta.words} words)`;
+            if (meta.modified) summary += ` modified: ${meta.modified}`;
+            return summary.trim() || null;
+          } catch { return null; }
+        }
+
+        function walk(dirPath, prefix, depth) {
+          if (maxDepth >= 0 && depth > maxDepth) return;
+          let entries; try { entries = fs.readdirSync(dirPath, { withFileTypes: true }); } catch { return; }
+          const sorted = entries.filter(e => !e.name.startsWith(".")).sort((a,b) => a.name.localeCompare(b.name));
+          for (let i = 0; i < sorted.length; i++) {
+            const e = sorted[i];
+            const full = path.join(dirPath, e.name);
+            const isLast = i === sorted.length - 1;
+            const connector = isLast ? "└── " : "├── ";
+            const childPrefix = isLast ? "    " : "│   ";
+
+            if (e.isDirectory()) {
+              dirCount++;
+              treeLines.push(`${prefix}${connector}📁 ${e.name}/`);
+              walk(full, prefix + childPrefix, depth + 1);
+            } else {
+              fileCount++;
+              const ext = path.extname(e.name).toLowerCase().replace(/^\./, "") || "file";
+              fileTypes[ext] = (fileTypes[ext] || 0) + 1;
+              try {
+                const stat = fs.statSync(full);
+                totalSize += stat.size;
+              } catch {}
+              const icon = fileIcon(e.name);
+              let label = `${prefix}${connector}${icon} ${e.name}`;
+              const meta = getSpotlightMeta(full);
+              if (meta && meta.length < 200 && meta !== e.name) {
+                label += ` — ${meta}`;
+              }
+              treeLines.push(label);
+            }
+          }
+        }
+
+        treeLines.push(`📁 ${dir}`);
+        walk(dir, "", 0);
+
+        const typeSummary = Object.entries(fileTypes)
+          .sort((a,b) => b[1] - a[1])
+          .map(([t, c]) => `- ${t}: ${c} file(s)`)
+          .join("\n");
+
+        const output = [
+          `Directory: ${dir}`,
+          `Files: ${fileCount} | Directories: ${dirCount} | Total size: ${formatBytes(totalSize)}`,
+          "",
+          "Tree:",
+          treeLines.join("\n"),
+          "",
+          "File types:",
+          typeSummary || "(none)",
+        ].join("\n");
+
+        return { content: [{ type: "text", text: output }] };
+      }
+      case "save_index": {
+        if (!args?.index) return { content: [{ type: "text", text: "Error: index content is required" }], isError: true };
+        if (!args?.name) return { content: [{ type: "text", text: "Error: name is required" }], isError: true };
+        const project = resolveProject(args);
+        const sanitizedName = String(args.name).replace(/[\/]/g, "-").replace(/\s+/g, "_").toLowerCase();
+        const indexPath = path.join(MEMORY_ROOT, "knowledge", "indexes", project, sanitizedName + ".json");
+        ensureDir(path.dirname(indexPath));
+        const entry = {
+          uri: `ctx://knowledge/indexes/${project}/${sanitizedName}`,
+          content: String(args.index),
+          source: "ai-context-bridge",
+          type: "index",
+          project: project,
+          timestamp: new Date().toISOString(),
+          tags: ["directory-index"],
+        };
+        fs.writeFileSync(indexPath, JSON.stringify(entry, null, 2), "utf8");
+        return { content: [{ type: "text", text: `✓ Saved index "${args.name}" to ctx://knowledge/indexes/${project}/${sanitizedName}` }] };
+      }
+      case "spotlight_search": {
+        const query = String(args?.query ?? "");
+        if (!query) return { content: [{ type: "text", text: "Error: query is required" }], isError: true };
+        const maxResults = Math.max(1, Math.min(2000, Number(args?.max_results) || 200));
+        const mdfindArgs = ["-onlyin", args?.directory || "/", query];
+        const r = spawnSync("mdfind", mdfindArgs, { encoding: "utf8", timeout: 30000 });
+        if (r.error) return { content: [{ type: "text", text: `Spotlight search failed: ${r.error.message}` }], isError: true };
+        const lines = r.stdout.split("\n").filter(Boolean).slice(0, maxResults);
+        const more = r.stdout.split("\n").filter(Boolean).length > maxResults ? ` (showing ${maxResults} of ${r.stdout.split("\n").filter(Boolean).length})` : "";
+        return { content: [{ type: "text", text: `${lines.length} result(s) for "${query}"${more}:\n${lines.join("\n") || "(no matches)"}` }] };
       }
       case "grep_code": {
         const pattern = String(args?.pattern ?? "");
@@ -871,23 +1251,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           type: args?.type || "note", project: args?.project || "global",
           tags: args?.tags || [],
         });
-        // Refresh the FTS index within its cooldown so the new entry is
-        // searchable promptly (bounded cost; no per-write full scan).
-        refreshMemoryIndex();
+        // Index the two new files immediately so the entry is searchable on
+        // the next call; a background full refresh handles everything else.
+        indexWrittenFiles([result.jsonFile, result.mdFile]);
         return { content: [{ type: "text", text: `✓ Memory written: ${result.uri}\n  JSON: ${result.jsonFile}\n  MD: ${result.mdFile}` }] };
       }
       case "memory_read": {
         let kind, subpath;
         if (args?.uri) {
-          const parsed = parseQwenURI(args.uri);
-          if (!parsed) return { content: [{ type: "text", text: `Invalid QwenURI: ${args.uri}` }], isError: true };
+          const parsed = parseMemoryURI(args.uri);
+          if (!parsed) return { content: [{ type: "text", text: `Invalid Memory URI: ${args.uri}` }], isError: true };
           kind = parsed.kind; subpath = parsed.path.join("/");
         } else {
           kind = args?.kind || "knowledge"; subpath = args?.path || "";
         }
         const data = readMemoryEntry(kind, subpath);
         if (!data) return { content: [{ type: "text", text: `No memory found at ${kind}/${subpath}` }] };
-        return { content: [{ type: "text", text: formatText(data) }] };
+        return { content: [{ type: "text", text: canonicalScheme(formatText(data)) }] };
       }
       case "memory_search": {
         const limit = Math.max(1, Math.min(Number(args?.max_results) || 20, 100));
@@ -905,25 +1285,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!hits.length) return { content: [{ type: "text", text: `No results for "${query}" in memory.` }] };
             const formatted = hits.map(r => `--- ${r.path} ---\n${r.snippet}`).join("\n\n");
             const note = isMemoryIndexReady() ? "" : "\n\n(index still warming — results from current index)";
-            return { content: [{ type: "text", text: `${hits.length} result(s):\n\n${formatted}${note}` }] };
+            const outText = canonicalScheme(`${hits.length} result(s):\n\n${formatted}${note}`);
+            return { content: [{ type: "text", text: outText }] };
           }
         }
 
-        const results = searchMemoryFiles(query, limit);
-        if (!results.length) return { content: [{ type: "text", text: `No results for "${query}" in memory.` }] };
+        const { matches: results, truncated: searchTruncated } = await searchMemoryFiles(query, limit);
+        if (!results.length) {
+          const partial = searchTruncated ? `\n\n(walk hit the ${MEMORY_SEARCH_BUDGET_MS / 1000}s budget before finishing — try a more specific query)` : "";
+          return { content: [{ type: "text", text: `No results for "${query}" in memory.${partial}` }] };
+        }
         const formatted = results.map(r => `--- ${r.file} (line ${r.line}) ---\n${r.snippet}`).join("\n\n");
-        return { content: [{ type: "text", text: `${results.length} result(s):\n\n${formatted}` }] };
+        const partial = searchTruncated ? `\n\n(partial results: walk stopped at the ${MEMORY_SEARCH_BUDGET_MS / 1000}s budget — try a more specific query)` : "";
+        return { content: [{ type: "text", text: canonicalScheme(`${results.length} result(s):\n\n${formatted}${partial}`) }] };
       }
       case "memory_list": {
         const kind = args?.kind || "knowledge";
-        const entries = listMemoryEntries(kind, args?.project);
-        if (!entries.length) return { content: [{ type: "text", text: `No entries in ${kind}${args?.project ? ` for project ${args.project}` : ""}.` }] };
-        const formatted = entries.map(e => `  ${e.uri}  [${e.type}] ${e.project} ${e.timestamp || ""} ${(e.tags||[]).map(t=>`#${t}`).join(" ")}`).join("\n");
-        return { content: [{ type: "text", text: `${entries.length} entries in ${kind}:\n${formatted}` }] };
+        const limit = Number(args?.limit) || 50;
+        const offset = Number(args?.offset) || 0;
+        const pathPrefix = args?.path ? String(args.path) : "";
+        const { total, entries, truncated: listTruncated } = await listMemoryEntries(kind, args?.project, pathPrefix, limit, offset);
+        if (!entries.length) return { content: [{ type: "text", text: `No entries in ${kind}${args?.project ? ` for project ${args.project}` : ""}${pathPrefix ? ` under ${pathPrefix}` : ""}.` }] };
+        const formatted = entries.map(e => `  ${canonicalUri(e.uri)}  [${e.type}] ${e.project} ${e.timestamp || ""} ${(e.tags||[]).map(t=>`#${t}`).join(" ")}`).join("\n");
+        const pageText = offset === 0 && entries.length === total
+          ? `${total} entries in ${kind}:`
+          : `Showing ${entries.length} of ${total} entries in ${kind} (offset ${offset}, limit ${limit}):`;
+        const partial = listTruncated ? `\n\n(partial listing: walk stopped at the ${MEMORY_WALK_BUDGET_MS / 1000}s budget — pass path/project or use memory_search to narrow)` : "";
+        return { content: [{ type: "text", text: `${pageText}\n${formatted}\n\nUse memory_search to find specific content, or increase offset to paginate.${partial}` }] };
       }
       case "memory_index": {
         if (args?.rebuild) {
-          if (memoryIndex) memoryIndex.reindexSync();
+          if (memoryIndex) memoryIndex.rebuildAsync();
           else return { content: [{ type: "text", text: "Memory index not available (better-sqlite3 not installed). Falling back to file-walking search." }] };
         }
         if (!memoryIndex) {
@@ -951,25 +1343,61 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "add_decision": {
         const p = resolveProject(args);
         const body = `**${args.title}**\n\n${args.decision}${args.rationale ? `\n\n*Rationale:* ${args.rationale}` : ""}`;
-        writeMemoryEntry({ uri: `qwen://knowledge/projects/${p}/decisions`, content: body, source: "AI Agent", type: "decision", project: p, tags: ["decision"] });
-        return { content: [{ type: "text", text: `✓ Decision logged to memory: qwen://knowledge/projects/${p}/decisions` }] };
+        const id = Date.now();
+        const uri = `ctx://knowledge/projects/${p}/decisions/${id}`;
+        const result = writeMemoryEntry({ uri, content: body, source: "AI Agent", type: "decision", project: p, tags: ["decision"] });
+        indexWrittenFiles([result.jsonFile, result.mdFile]);
+        return { content: [{ type: "text", text: `✓ Decision logged to memory: ${uri}` }] };
       }
       case "report_error": {
         const p = resolveProject(args);
         const body = `**Severity:** ${args.severity ?? "unspecified"}\n\n${args.error}${args.context ? `\n\n*Context:* ${args.context}` : ""}`;
-        writeMemoryEntry({ uri: `qwen://knowledge/projects/${p}/errors`, content: body, source: "AI Agent", type: "error", project: p, tags: ["error", args.severity || "unspecified"] });
-        return { content: [{ type: "text", text: `✓ Error logged to memory: qwen://knowledge/projects/${p}/errors` }] };
+        const id = Date.now();
+        const uri = `ctx://knowledge/projects/${p}/errors/${id}`;
+        const result = writeMemoryEntry({ uri, content: body, source: "AI Agent", type: "error", project: p, tags: ["error", args.severity || "unspecified"] });
+        indexWrittenFiles([result.jsonFile, result.mdFile]);
+        return { content: [{ type: "text", text: `✓ Error logged to memory: ${uri}` }] };
       }
       case "update_session": {
         const p = resolveProject(args);
-        writeMemoryEntry({ uri: `qwen://context/projects/${p}/session`, content: `**${args.key}:** ${args.value}`, source: "AI Agent", type: "session-update", project: p, tags: ["session", args.key] });
+        const id = Date.now();
+        const uri = `ctx://context/projects/${p}/session/${id}`;
+        const result = writeMemoryEntry({ uri, content: `**${args.key}:** ${args.value}`, source: "AI Agent", type: "session-update", project: p, tags: ["session", args.key] });
+        indexWrittenFiles([result.jsonFile, result.mdFile]);
         return { content: [{ type: "text", text: `✓ Session updated in memory: ${args.key}=${args.value} for ${p}` }] };
       }
       case "add_todo": {
         const p = resolveProject(args);
         const body = `- [ ]${args.priority ? ` [${args.priority.toUpperCase()}]` : ""}${args.assignee ? ` → ${args.assignee}` : ""} ${args.task}`;
-        writeMemoryEntry({ uri: `qwen://knowledge/projects/${p}/todos`, content: body, source: "AI Agent", type: "todo", project: p, tags: ["todo", args.priority || "medium"] });
-        return { content: [{ type: "text", text: `✓ Todo added to memory: qwen://knowledge/projects/${p}/todos` }] };
+        const id = Date.now();
+        const uri = `ctx://knowledge/projects/${p}/todos/${id}`;
+        const result = writeMemoryEntry({ uri, content: body, source: "AI Agent", type: "todo", project: p, tags: ["todo", args.priority || "medium"] });
+        indexWrittenFiles([result.jsonFile, result.mdFile]);
+        return { content: [{ type: "text", text: `✓ Todo added to memory: ${uri}` }] };
+      }
+      case "update_sync_state": {
+        const p = resolveProject(args);
+        const state = {
+          machine: MACHINE_HOSTNAME,
+          machine_id: MACHINE_ID,
+          updated: new Date().toISOString(),
+          last_commit: args.last_commit || null,
+          branch: args.branch || null,
+          in_progress: args.in_progress || null,
+          dirty: typeof args.dirty === "boolean" ? args.dirty : null,
+          note: args.note || null,
+        };
+        const uri = `ctx://context/projects/${p}/sync-state`;
+        const result = writeMemoryEntry({
+          uri,
+          content: "```json\n" + JSON.stringify(state, null, 2) + "\n```",
+          source: "AI Agent",
+          type: "sync-state",
+          project: p,
+          tags: ["sync-state", MACHINE_HOSTNAME],
+        });
+        indexWrittenFiles([result.jsonFile, result.mdFile]);
+        return { content: [{ type: "text", text: `✓ Sync state updated for ${p} (machine: ${MACHINE_HOSTNAME}, commit: ${state.last_commit || "unknown"}, in_progress: ${state.in_progress || "none"})` }] };
       }
       case "list_active_contexts": {
         // List projects from unified memory
@@ -1131,10 +1559,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 const transport = new StdioServerTransport();
-
-// Warm the SQLite FTS5 memory index in the background; this returns immediately
-// and never blocks server startup. Until it finishes, memory_search falls back
-// to the (correct but slower) file-walking scan.
-startMemoryIndex();
-
 await server.connect(transport);
+// Build the FTS index off-thread after we're serving, so the first
+// memory_search is already fast instead of walking 45k files.
+startMemoryIndex();
