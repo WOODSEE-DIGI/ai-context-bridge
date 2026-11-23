@@ -19,7 +19,7 @@ This repo is the **framework**, not the contents: your own memory stays in `~/.a
 | **MCP server** | `server.js` | ~35 tools: memory read/write/search, project context, skills, build/Obsidian helpers |
 | **Memory store** | `~/.ai-context/memory/` | Plain `.json` + `.md` files, addressed by URI. The source of truth. |
 | **FTS index** | `~/.ai-context/memory-index.sqlite` | Derived cache for fast `memory_search`. Rebuilt automatically; safe to delete. |
-| **Skills** | `skills/` | Reusable instruction modules the agent loads on demand (`list_skills` / `read_skill`) |
+| **Skills** | `skills/` | Reusable instruction modules the agent loads on demand (`list_skills` / `read_skill`) — e.g. `resume-project` for cross-machine continuity |
 
 **Memory addresses** — every URI maps to a folder:
 
@@ -90,6 +90,7 @@ You never hand-type tool JSON. Two steps:
 | `add_todo` | "High priority: implement the settings tab." | `ctx://knowledge/projects/<p>/todos` |
 | `report_error` | "Build failed with code 65." | `ctx://knowledge/projects/<p>/errors` |
 | `update_session` | "Deploy state is: v1.2 live on prod." | `ctx://context/projects/<p>/session` |
+| `update_sync_state` | "Note I'm on commit abc123, mid-way through the indexing fix." | `ctx://context/projects/<p>/sync-state` |
 | `set_active_project` | "Active project is FooApp." | `ctx://context/active-project` |
 
 **Recall tools:**
