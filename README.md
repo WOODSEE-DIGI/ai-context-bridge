@@ -8,6 +8,9 @@ A file-first memory layer for AI agents, exposed as an [MCP](https://modelcontex
 
 This repo is the **framework**, not the contents: your own memory stays in `~/.ai-context/memory/` on your machine.
 
+> **Installing? → [INSTALL.md](INSTALL.md)** — complete zero-to-working steps,
+> requirements, verification, and troubleshooting. Read it first.
+
 ---
 
 ## What are we working with?
@@ -45,42 +48,22 @@ The bridge has **no chat UI**. You talk to your agent; the agent calls the tools
 
 ### One-time setup
 
-**First, what you're looking at** — this repo ships *source only*:
-
-- `node_modules/` is **intentionally absent** (gitignored). It is not missing,
-  broken, or lost — `npm install` creates it from `package.json`. Never commit it.
-- Same for `package-lock.json` and any `*.bak` files: local-only, by design.
-- `package.json` is the shopping list; `node_modules/` is the groceries.
-
-**Requirements** — [Node.js](https://nodejs.org) ≥ 18 (`node --version` to check)
-and a C/C++ toolchain for `better-sqlite3` (macOS: `xcode-select --install`).
+Full steps, verification, and troubleshooting: **[INSTALL.md](INSTALL.md)**.
+The short version:
 
 ```bash
 git clone <this repo> && cd ai-context-bridge
-npm install          # creates node_modules/ — this is expected and required
+npm install          # creates node_modules/ — gitignored, expected, required
 node server.js       # sanity check — it speaks MCP over stdio
 ```
 
-If `npm install` fails, the server still runs: `memory_search` degrades to a
-slower folder scan until the dependency is built. Everything else works.
+Then register the server in your MCP client (config is in
+[INSTALL.md](INSTALL.md) — use an absolute path), **fully restart the
+chat program** (clients read MCP config only at launch), and confirm with
+"list my active contexts".
 
-Register it in your MCP client:
-
-```json
-{
-  "mcpServers": {
-    "ai-context-bridge": {
-      "command": "node",
-      "args": ["/path/to/ai-context-bridge/server.js"]
-    }
-  }
-}
-```
-
-**Restart the chat program** — MCP clients only read their config at launch, so
-the server starts on the next session. If it doesn't appear, check the client's
-MCP log: the usual causes are a wrong path, missing `npm install`, or a client
-that needs an absolute path.
+> This repo ships **source only** — `node_modules/` and `package-lock.json` are
+> gitignored by design. Their absence after cloning is normal, not a fault.
 
 Paths resolve from `$HOME` or env vars — no hardcoded usernames:
 `AI_GITHUB_ROOT` (default `~/Documents/GitHub`), `OBSIDIAN_REST_API_KEY`, `WHISPERKIT_SWITCH_SCRIPT`.
