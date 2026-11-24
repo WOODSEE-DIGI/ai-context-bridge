@@ -13,6 +13,54 @@ This repo is the **framework**, not the contents: your own memory stays in `~/.a
 
 ---
 
+## See it in action — two real sessions
+
+The captures below come from two ordinary working sessions on the same project. They show the whole point of the bridge: **memory follows the work, not the chat window.**
+
+![Original Discord posts with captions for both scenarios](Screenshots/Posts-to-discord-showing-captions.png)
+
+### 1. One computer, different apps and models, different times
+
+**OpenCode, online model (Moonshot AI / Kimi K2.7 Code).** The user is drafting a Storyteller / ArtCraft outreach email and says *"save progress and save the plan for sending the email etc"*. The agent calls `add_todo` and `add_decision` — the plan is saved to a project file **and** to the shared store, which the reply shows under "Unified memory (ai-context-bridge)":
+
+![OpenCode saving a todo and decision through the bridge](Screenshots/Opencode-1st-computer-project-created.png)
+
+**Later, SwiftMaestro, local model (Gemma 4 26B running on-machine).** A different app, a different model, a different time of day. The user asks *"search memory for 'artcraft outreach'"*. The agent finds the plan, the email draft, the todo, and the decision record in one search:
+
+![Local model in SwiftMaestro recalling work saved by the online model](Screenshots/SwiftMaestro-1st-computer-local-model.png)
+
+Nothing was copied between the two chats. The online model wrote plain files; the local model searched those same files.
+
+### 2. The next day, on a second Mac
+
+**OpenCode again, a different model (the "Big Pickle" session), on another computer.** The user asks *"search context, can you find the email I was going to send storyteller?"* The agent discovers the bridge tools, then searches `memory_search`, `search_vault`, and `search_conversation_history` in parallel:
+
+![Second Mac discovering and searching the shared memory](Screenshots/Opencode-2nd-computer-1.png)
+
+It finds `ctx://knowledge/swiftmaestro/storyteller-outreach-email.md`, still dated **2026-11-23** — the day the other Mac wrote it — plus a matching copy under `conversations/`, and reads the full draft:
+
+![Bridge locates the email in knowledge and conversation history](Screenshots/Opencode-2nd-computer-2.png)
+
+![The full email draft recalled on the second Mac](Screenshots/Opencode-2nd-computer-3.png)
+
+The store is a folder in iCloud Drive ([setup below](#optional-multiple-machines)); the second Mac simply sees the same files. The FTS index is a per-machine cache rebuilt locally, so only the source files travel.
+
+### Why this matters
+
+| Benefit | Visible in the captures |
+|---|---|
+| **Model-agnostic** | An online model saved the work; a local Gemma model recalled it. The bridge never sees or cares which LLM is driving. |
+| **Client-agnostic** | OpenCode and SwiftMaestro share no plugins or chat history — the shared files are the only common layer. |
+| **Time-agnostic** | Work saved on Nov 23 is found on Nov 24 with its original timestamp and full text intact. No "what was I doing?" archaeology. |
+| **Machine-agnostic** | Second Mac, same project, no export/import or copy-paste. iCloud (or Dropbox/Syncthing) does the transport. |
+| **Provenance, not just content** | Every entry carries `project`, `type`, `timestamp`, and `machine` — you can see *where* and *when* a decision was made. |
+| **Structure plus raw history** | Curated knowledge (`ctx://knowledge/...`) and verbatim conversation history are searched side by side; `memory_read` then pulls the complete text. |
+| **No lock-in** | It is all `.json` and `.md` files in `~/.ai-context/memory/`. Unplug the bridge and your notes are still readable. |
+
+The habit to copy is deliberately small: **say it once, in plain language, to whichever agent you happen to be using** — "save progress and the plan", "find the email I was going to send X" — and let the bridge carry it across apps, models, and machines.
+
+---
+
 ## What are we working with?
 
 **Four pieces:**
@@ -125,54 +173,6 @@ mkdir -p ~/.ai-context/skills && cp -R skills/resume-project ~/.ai-context/skill
 The resume skill reconciles memory with git: reads `ctx://context/projects/<name>/sync-state`, detects which machine last worked, compares local commits to the recorded one, and **asks before pulling or pushing**.
 
 The FTS index is a per-machine cache rebuilt from the shared files — never sync or commit it. If something's off (broken link, iCloud not caught up, skill not discovered), diagnose and fix it directly.
-
----
-
-## See it in action — two real sessions
-
-The captures below come from two ordinary working sessions on the same project. They show the whole point of the bridge: **memory follows the work, not the chat window.**
-
-![Original Discord posts with captions for both scenarios](Screenshots/Posts-to-discord-showing-captions.png)
-
-### 1. One computer, different apps and models, different times
-
-**OpenCode, online model (Moonshot AI / Kimi K2.7 Code).** The user is drafting a Storyteller / ArtCraft outreach email and says *"save progress and save the plan for sending the email etc"*. The agent calls `add_todo` and `add_decision` — the plan is saved to a project file **and** to the shared store, which the reply shows under "Unified memory (ai-context-bridge)":
-
-![OpenCode saving a todo and decision through the bridge](Screenshots/Opencode-1st-computer-project-created.png)
-
-**Later, SwiftMaestro, local model (Gemma 4 26B running on-machine).** A different app, a different model, a different time of day. The user asks *"search memory for 'artcraft outreach'"*. The agent finds the plan, the email draft, the todo, and the decision record in one search:
-
-![Local model in SwiftMaestro recalling work saved by the online model](Screenshots/SwiftMaestro-1st-computer-local-model.png)
-
-Nothing was copied between the two chats. The online model wrote plain files; the local model searched those same files.
-
-### 2. The next day, on a second Mac
-
-**OpenCode again, a different model (the "Big Pickle" session), on another computer.** The user asks *"search context, can you find the email I was going to send storyteller?"* The agent discovers the bridge tools, then searches `memory_search`, `search_vault`, and `search_conversation_history` in parallel:
-
-![Second Mac discovering and searching the shared memory](Screenshots/Opencode-2nd-computer-1.png)
-
-It finds `ctx://knowledge/swiftmaestro/storyteller-outreach-email.md`, still dated **2026-11-23** — the day the other Mac wrote it — plus a matching copy under `conversations/`, and reads the full draft:
-
-![Bridge locates the email in knowledge and conversation history](Screenshots/Opencode-2nd-computer-2.png)
-
-![The full email draft recalled on the second Mac](Screenshots/Opencode-2nd-computer-3.png)
-
-The store is a folder in iCloud Drive ([setup above](#optional-multiple-machines)); the second Mac simply sees the same files. The FTS index is a per-machine cache rebuilt locally, so only the source files travel.
-
-### Why this matters
-
-| Benefit | Visible in the captures |
-|---|---|
-| **Model-agnostic** | An online model saved the work; a local Gemma model recalled it. The bridge never sees or cares which LLM is driving. |
-| **Client-agnostic** | OpenCode and SwiftMaestro share no plugins or chat history — the shared files are the only common layer. |
-| **Time-agnostic** | Work saved on Nov 23 is found on Nov 24 with its original timestamp and full text intact. No "what was I doing?" archaeology. |
-| **Machine-agnostic** | Second Mac, same project, no export/import or copy-paste. iCloud (or Dropbox/Syncthing) does the transport. |
-| **Provenance, not just content** | Every entry carries `project`, `type`, `timestamp`, and `machine` — you can see *where* and *when* a decision was made. |
-| **Structure plus raw history** | Curated knowledge (`ctx://knowledge/...`) and verbatim conversation history are searched side by side; `memory_read` then pulls the complete text. |
-| **No lock-in** | It is all `.json` and `.md` files in `~/.ai-context/memory/`. Unplug the bridge and your notes are still readable. |
-
-The habit to copy is deliberately small: **say it once, in plain language, to whichever agent you happen to be using** — "save progress and the plan", "find the email I was going to send X" — and let the bridge carry it across apps, models, and machines.
 
 ---
 
