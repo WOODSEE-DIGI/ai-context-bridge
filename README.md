@@ -17,7 +17,7 @@ This repo is the **framework**, not the contents: your own memory stays in `~/.a
 
 The captures below come from two ordinary working sessions on the same project. They show the whole point of the bridge: **memory follows the work, not the chat window.**
 
-**Video walkthrough (8:09):** [OpenCode MCP Server Easy Installer to Xcode Bliss](https://youtu.be/wnFE4uxgIsA)
+**Setup walkthrough (8:09) — fresh Mac to building in Xcode with an OpenCode agent:** [OpenCode MCP Server Easy Installer to Xcode Bliss](https://youtu.be/wnFE4uxgIsA)
 
 [![Watch the walkthrough on YouTube](https://img.youtube.com/vi/wnFE4uxgIsA/hqdefault.jpg)](https://youtu.be/wnFE4uxgIsA)
 
